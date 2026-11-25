@@ -1,0 +1,587 @@
+--- a/main/boards/caiyu-c3/caiyu_web_server.h
++++ b/main/boards/caiyu-c3/caiyu_web_server.h
+@@ -5,6 +5,8 @@
+ #include <esp_http_server.h>
+ 
+ #include <cstddef>
++#include <cstdint>
++#include <mutex>
+ #include <string>
+ 
+ #include "device_state.h"
+@@ -32,10 +34,24 @@
+ 
+     void SyncChatState();
+ 
++    /**
++     * 把一帧姿态快照推给"订阅了遥测"的客户端（Unity 数字孪生用）。
++     * 由板卡守护任务按固定节拍调用；没有订阅者时立刻返回，开销只是一次函数调用。
++     */
++    void PushTelemetry();
++
+ private:
+-    static constexpr int kMaxSockets = 5;
+-    static constexpr size_t kMaxMessageLen = 1024;
++    static constexpr int kMaxSockets = 8;
++    static constexpr size_t kMaxMessageLen = 2048;
++    static constexpr int kDefaultTelemetryHz = 20;
++    static constexpr int kMaxTelemetryHz = 30;
+ 
++    // 每个 WS 客户端单独记一个订阅位：手机网页不订阅，就不会被 20 Hz 快照刷屏。
++    struct Client {
++        int fd = 0;
++        bool telemetry = false;
++    };
++
+     static esp_err_t RootHandler(httpd_req_t* req);
+     static esp_err_t StyleHandler(httpd_req_t* req);
+     static esp_err_t ScriptHandler(httpd_req_t* req);
+@@ -61,8 +77,15 @@
+     void SendTrimState(httpd_req_t* req);
+     void HandleSpeed(httpd_req_t* req, const cJSON* root);
+     void SendSpeedState(httpd_req_t* req);
++    void HandleTelemetry(httpd_req_t* req, const cJSON* root);
+     void BroadcastJson(const std::string& message);
+ 
++    // 姿态快照：一次遍历拼出完整 JSON（不走 cJSON，省堆也省 CPU）。
++    std::string BuildTelemetryJson() const;
++    void BroadcastTelemetry(const std::string& message);
++    bool HasTelemetryClients() const;
++    void SetClientTelemetry(int fd, bool enabled);
++
+     static void SendText(httpd_req_t* req, const std::string& message);
+     void AddClient(int fd);
+     void RemoveClient(int fd);
+@@ -72,7 +95,15 @@
+     caiyu::Actionments* actionments_ = nullptr;
+     int port_ = 80;
+     httpd_handle_t server_ = nullptr;
+-    int clients_[kMaxSockets] = {};
++
++    mutable std::mutex client_mutex_;
++    Client clients_[kMaxSockets] = {};
++    int telemetry_hz_ = kDefaultTelemetryHz;
++    uint32_t last_telemetry_ms_ = 0;
++
++    // WS 帧缓冲提到成员里，避免 2 KB 数组压在 httpd 任务的栈上。
++    uint8_t rx_buffer_[kMaxMessageLen + 1] = {};
++
+     DeviceState last_chat_state_ = kDeviceStateUnknown;
+ 
+     static CaiyuWebServer* instance_;
+--- a/main/boards/caiyu-c3/caiyu_web_server.cc
++++ b/main/boards/caiyu-c3/caiyu_web_server.cc
+@@ -2,6 +2,7 @@
+ 
+ #include <esp_app_desc.h>
+ #include <esp_log.h>
++#include <esp_timer.h>
+ #include <freertos/FreeRTOS.h>
+ #include <freertos/task.h>
+ 
+@@ -49,6 +50,9 @@
+         cJSON_AddItemToArray(actions, cJSON_CreateString(caiyu::Actionments::ActionName(index)));
+     }
+ 
++    // 能力位：客户端据此判断能否订阅姿态遥测。
++    cJSON_AddBoolToObject(root, "telemetry", true);
++
+     char* text = cJSON_PrintUnformatted(root);
+     std::string message = (text != nullptr) ? text : R"({"type":"hello"})";
+     if (text != nullptr) {
+@@ -119,8 +123,37 @@
+     free(job);
+ }
+ 
++// 把一条文本帧异步派发给给定的 fd 列表（0 表示空槽）。调用方负责先把 fd 快照出来，
++// 避免在持锁状态下 malloc / 排 work。
++void SendJsonToFds(httpd_handle_t server, const int* fds, size_t count, const std::string& message) {
++    if (server == nullptr) {
++        return;
++    }
++    for (size_t i = 0; i < count; ++i) {
++        if (fds[i] == 0) {
++            continue;
++        }
++        auto* job = static_cast<ChatBroadcastJob*>(malloc(sizeof(ChatBroadcastJob)));
++        auto* payload = static_cast<char*>(malloc(message.size()));
++        if (job == nullptr || payload == nullptr) {
++            free(job);
++            free(payload);
++            continue;
++        }
++        memcpy(payload, message.c_str(), message.size());
++        job->server = server;
++        job->fd = fds[i];
++        job->payload = payload;
++        job->len = message.size();
++        if (httpd_queue_work(server, ChatBroadcastJobFn, job) != ESP_OK) {
++            free(payload);
++            free(job);
++        }
++    }
+ }
+ 
++}
++
+ CaiyuWebServer::CaiyuWebServer(CaiyuDisplay* display, StripController* strip,
+                                caiyu::Actionments* actionments, int port)
+     : display_(display), strip_(strip), actionments_(actionments), port_(port) {
+@@ -180,7 +213,14 @@
+     }
+     httpd_stop(server_);
+     server_ = nullptr;
+-    memset(clients_, 0, sizeof(clients_));
++    {
++        std::lock_guard<std::mutex> lock(client_mutex_);
++        for (auto& client : clients_) {
++            client.fd = 0;
++            client.telemetry = false;
++        }
++        last_telemetry_ms_ = 0;
++    }
+     ESP_LOGI(TAG, "control page stopped");
+ }
+ 
+@@ -211,14 +251,16 @@
+ }
+ 
+ void CaiyuWebServer::AddClient(int fd) {
+-    for (int& slot : clients_) {
+-        if (slot == fd) {
++    std::lock_guard<std::mutex> lock(client_mutex_);
++    for (auto& client : clients_) {
++        if (client.fd == fd) {
+             return;
+         }
+     }
+-    for (int& slot : clients_) {
+-        if (slot == 0) {
+-            slot = fd;
++    for (auto& client : clients_) {
++        if (client.fd == 0) {
++            client.fd = fd;
++            client.telemetry = false;
+             ESP_LOGI(TAG, "client connected: %d", fd);
+             return;
+         }
+@@ -227,24 +269,53 @@
+ }
+ 
+ void CaiyuWebServer::RemoveClient(int fd) {
+-    for (int& slot : clients_) {
+-        if (slot == fd) {
+-            slot = 0;
++    std::lock_guard<std::mutex> lock(client_mutex_);
++    for (auto& client : clients_) {
++        if (client.fd == fd) {
++            client.fd = 0;
++            client.telemetry = false;
+             ESP_LOGI(TAG, "client closed: %d", fd);
+             return;
+         }
+     }
+ }
+ 
++void CaiyuWebServer::SetClientTelemetry(int fd, bool enabled) {
++    std::lock_guard<std::mutex> lock(client_mutex_);
++    for (auto& client : clients_) {
++        if (client.fd == fd) {
++            if (client.telemetry != enabled) {
++                client.telemetry = enabled;
++                ESP_LOGI(TAG, "fd %d telemetry %s", fd, enabled ? "on" : "off");
++            }
++            if (!enabled) {
++                last_telemetry_ms_ = 0;
++            }
++            return;
++        }
++    }
++}
++
+ bool CaiyuWebServer::HasClients() const {
+-    for (int fd : clients_) {
+-        if (fd != 0) {
++    std::lock_guard<std::mutex> lock(client_mutex_);
++    for (const auto& client : clients_) {
++        if (client.fd != 0) {
+             return true;
+         }
+     }
+     return false;
+ }
+ 
++bool CaiyuWebServer::HasTelemetryClients() const {
++    std::lock_guard<std::mutex> lock(client_mutex_);
++    for (const auto& client : clients_) {
++        if (client.fd != 0 && client.telemetry) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ void CaiyuWebServer::SyncChatState() {
+     const DeviceState state = Application::GetInstance().GetDeviceState();
+     if (state == last_chat_state_) {
+@@ -263,27 +334,28 @@
+     if (server_ == nullptr) {
+         return;
+     }
+-    for (int fd : clients_) {
+-        if (fd == 0) {
+-            continue;
+-        }
+-        auto* job = static_cast<ChatBroadcastJob*>(malloc(sizeof(ChatBroadcastJob)));
+-        auto* payload = static_cast<char*>(malloc(message.size()));
+-        if (job == nullptr || payload == nullptr) {
+-            free(job);
+-            free(payload);
+-            continue;
++    int fds[kMaxSockets] = {};
++    {
++        std::lock_guard<std::mutex> lock(client_mutex_);
++        for (int i = 0; i < kMaxSockets; ++i) {
++            fds[i] = clients_[i].fd;
+         }
+-        memcpy(payload, message.c_str(), message.size());
+-        job->server = server_;
+-        job->fd = fd;
+-        job->payload = payload;
+-        job->len = message.size();
+-        if (httpd_queue_work(server_, ChatBroadcastJobFn, job) != ESP_OK) {
+-            free(payload);
+-            free(job);
++    }
++    SendJsonToFds(server_, fds, static_cast<size_t>(kMaxSockets), message);
++}
++
++void CaiyuWebServer::BroadcastTelemetry(const std::string& message) {
++    if (server_ == nullptr) {
++        return;
++    }
++    int fds[kMaxSockets] = {};
++    {
++        std::lock_guard<std::mutex> lock(client_mutex_);
++        for (int i = 0; i < kMaxSockets; ++i) {
++            fds[i] = clients_[i].telemetry ? clients_[i].fd : 0;
+         }
+     }
++    SendJsonToFds(server_, fds, static_cast<size_t>(kMaxSockets), message);
+ }
+ 
+ esp_err_t CaiyuWebServer::WsHandler(httpd_req_t* req) {
+@@ -323,14 +395,13 @@
+         return ESP_OK;
+     }
+ 
+-    uint8_t payload[kMaxMessageLen + 1];
+-    frame.payload = payload;
++    frame.payload = rx_buffer_;
+     err = httpd_ws_recv_frame(req, &frame, frame.len);
+     if (err != ESP_OK) {
+         return err;
+     }
+-    payload[frame.len] = '\0';
+-    HandleMessage(req, reinterpret_cast<const char*>(payload), frame.len);
++    rx_buffer_[frame.len] = '\0';
++    HandleMessage(req, reinterpret_cast<const char*>(rx_buffer_), frame.len);
+     return ESP_OK;
+ }
+ 
+@@ -363,6 +434,10 @@
+         HandleTrim(req, root);
+     } else if (strcmp(type->valuestring, "speed") == 0) {
+         HandleSpeed(req, root);
++    } else if (strcmp(type->valuestring, "telemetry") == 0) {
++        HandleTelemetry(req, root);
++    } else if (strcmp(type->valuestring, "snapshot") == 0) {
++        SendText(req, BuildTelemetryJson());
+     } else if (strcmp(type->valuestring, "ping") == 0) {
+         const cJSON* stamp = cJSON_GetObjectItem(root, "t");
+         cJSON* pong = cJSON_CreateObject();
+@@ -619,6 +694,124 @@
+     cJSON_Delete(state);
+ }
+ 
++std::string CaiyuWebServer::BuildTelemetryJson() const {
++    std::string json;
++    json.reserve(320);
++
++    const DeviceState state = Application::GetInstance().GetDeviceState();
++
++    json += "{\"type\":\"telemetry\",\"t\":";
++    json += std::to_string(static_cast<uint32_t>(esp_timer_get_time() / 1000));
++    json += ",\"state\":\"";
++    json += DeviceStateMachine::GetStateName(state);
++    json += "\",\"voice\":";
++    json += Application::GetInstance().IsVoiceDetected() ? "true" : "false";
++
++    if (display_ != nullptr) {
++        json += ",\"emotion\":\"";
++        json += caiyu::EmotionToName(display_->current_emotion());
++        json += '"';
++    }
++
++    if (actionments_ != nullptr) {
++        json += ",\"action\":\"";
++        json += caiyu::Actionments::ActionName(actionments_->current());
++        json += "\",\"busy\":";
++        json += actionments_->busy() ? "true" : "false";
++        json += ",\"drive\":\"";
++        json += caiyu::Actionments::DriveName(actionments_->drive());
++        json += "\",\"speed\":";
++        json += std::to_string(actionments_->speed_percent());
++
++        json += ",\"legs\":[";
++        for (int i = 0; i < caiyu::kLegCount; ++i) {
++            if (i != 0) {
++                json += ',';
++            }
++            json += std::to_string(actionments_->leg_angle(i));
++        }
++        json += ']';
++
++        json += ",\"trims\":[";
++        for (int i = 0; i < caiyu::kLegCount; ++i) {
++            if (i != 0) {
++                json += ',';
++            }
++            json += std::to_string(actionments_->leg_trim(i));
++        }
++        json += ']';
++    }
++
++    if (strip_ != nullptr) {
++        uint8_t r = 0;
++        uint8_t g = 0;
++        uint8_t b = 0;
++        strip_->GetColor(r, g, b);
++
++        json += ",\"lamp\":{\"on\":";
++        json += strip_->IsOn() ? "true" : "false";
++        json += ",\"mode\":";
++        json += std::to_string(strip_->Mode());
++        json += ",\"brightness\":";
++        json += std::to_string(static_cast<int>(strip_->Brightness()));
++        json += ",\"speed\":";
++        json += std::to_string(strip_->speed_percent());
++        json += ",\"r\":";
++        json += std::to_string(static_cast<int>(r));
++        json += ",\"g\":";
++        json += std::to_string(static_cast<int>(g));
++        json += ",\"b\":";
++        json += std::to_string(static_cast<int>(b));
++        json += '}';
++    }
++
++    json += '}';
++    return json;
++}
++
++void CaiyuWebServer::PushTelemetry() {
++    if (!HasTelemetryClients()) {
++        return;
++    }
++
++    const int hz = (telemetry_hz_ > 0) ? telemetry_hz_ : kDefaultTelemetryHz;
++    const uint32_t interval_ms = static_cast<uint32_t>(1000 / hz);
++    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000);
++    if (last_telemetry_ms_ != 0 && (now_ms - last_telemetry_ms_) < interval_ms) {
++        return;
++    }
++    last_telemetry_ms_ = now_ms;
++
++    BroadcastTelemetry(BuildTelemetryJson());
++}
++
++void CaiyuWebServer::HandleTelemetry(httpd_req_t* req, const cJSON* root) {
++    const int fd = httpd_req_to_sockfd(req);
++
++    const cJSON* enable = cJSON_GetObjectItem(root, "enable");
++    const bool off = cJSON_IsBool(enable) && !cJSON_IsTrue(enable);
++
++    if (off) {
++        SetClientTelemetry(fd, false);
++    } else {
++        const cJSON* hz_item = cJSON_GetObjectItem(root, "hz");
++        if (cJSON_IsNumber(hz_item)) {
++            int hz = hz_item->valueint;
++            if (hz < 1) {
++                hz = 1;
++            } else if (hz > kMaxTelemetryHz) {
++                hz = kMaxTelemetryHz;
++            }
++            telemetry_hz_ = hz;
++        }
++        AddClient(fd);
++        SetClientTelemetry(fd, true);
++    }
++
++    // 无论订阅还是退订，都先回一帧当前姿态：Unity 连上后立刻有初始位形。
++    SendText(req, BuildTelemetryJson());
++}
++
+ void CaiyuWebServer::SendText(httpd_req_t* req, const std::string& message) {
+     httpd_ws_frame_t frame = {};
+     frame.type = HTTPD_WS_TYPE_TEXT;
+--- a/main/boards/caiyu-c3/caiyu_c3_board.cc
++++ b/main/boards/caiyu-c3/caiyu_c3_board.cc
+@@ -153,73 +153,90 @@
+             board->web_server_ = new CaiyuWebServer(board->caiyu_display_, board->strip_,
+                                                     board->actionments_);
+ 
++            // 遥测节拍：Unity 数字孪生靠这个频率做插值，20 Hz 足够平滑，
++            // 又不至于把 C3 的 WiFi 带宽和 malloc 打满。
++            constexpr uint32_t kTelemetryTickMs = 50;
++            // 守护逻辑（起停服务、状态变化、情绪小动作）保持 200 ms 粒度即可。
++            constexpr uint32_t kHousekeepingMs = 200;
++            constexpr uint32_t kMoodCooldownMs = 2000;
++
+             bool address_logged = false;
+             DeviceState last_state = Application::GetInstance().GetDeviceState();
+             caiyu::Emotion last_emotion = caiyu::Emotion::kNeutral;
+             TickType_t last_mood_tick = 0;
+-            constexpr uint32_t kMoodCooldownMs = 2000;
++            TickType_t last_housekeeping = 0;
++
+             while (true) {
+-                const bool in_config = board->IsInWifiConfigMode();
+-                if (in_config) {
+-                    board->config_mode_guard_until_ = 0;
+-                }
+-                const bool config_guard =
+-                    board->config_mode_guard_until_ != 0 &&
+-                    static_cast<int32_t>(board->config_mode_guard_until_ -
+-                                         xTaskGetTickCount()) > 0;
+-                const bool can_serve = !config_guard && !in_config &&
+-                                       WifiManager::GetInstance().IsConnected();
+-                if (!can_serve) {
+-                    board->StopControlServer();
+-                    address_logged = false;
+-                } else {
+-                    if (!board->web_server_->started() && !board->web_server_->Start()) {
+-                        vTaskDelay(pdMS_TO_TICKS(10000));
+-                        continue;
++                // 高频部分：只推姿态快照，没有订阅者时 PushTelemetry 立即返回。
++                board->web_server_->PushTelemetry();
++
++                const TickType_t now = xTaskGetTickCount();
++                if (last_housekeeping == 0 ||
++                    (now - last_housekeeping) >= pdMS_TO_TICKS(kHousekeepingMs)) {
++                    last_housekeeping = now;
++
++                    const bool in_config = board->IsInWifiConfigMode();
++                    if (in_config) {
++                        board->config_mode_guard_until_ = 0;
+                     }
+-                    if (!address_logged) {
+-                        const std::string ip = IpOfInterface("WIFI_STA_DEF");
+-                        if (!ip.empty()) {
+-                            ESP_LOGI(TAG, "control page: http://%s/", ip.c_str());
+-                            address_logged = true;
++                    const bool config_guard =
++                        board->config_mode_guard_until_ != 0 &&
++                        static_cast<int32_t>(board->config_mode_guard_until_ - now) > 0;
++                    const bool can_serve = !config_guard && !in_config &&
++                                           WifiManager::GetInstance().IsConnected();
++                    if (!can_serve) {
++                        board->StopControlServer();
++                        address_logged = false;
++                    } else {
++                        if (!board->web_server_->started() && !board->web_server_->Start()) {
++                            vTaskDelay(pdMS_TO_TICKS(10000));
++                            continue;
+                         }
++                        if (!address_logged) {
++                            const std::string ip = IpOfInterface("WIFI_STA_DEF");
++                            if (!ip.empty()) {
++                                ESP_LOGI(TAG, "control page: http://%s/", ip.c_str());
++                                address_logged = true;
++                            }
++                        }
+                     }
+-                }
+-                board->RefreshPowerSaveLevel();
+-                board->web_server_->SyncChatState();
++                    board->RefreshPowerSaveLevel();
++                    board->web_server_->SyncChatState();
+ 
+-                const DeviceState state = Application::GetInstance().GetDeviceState();
+-                if (state != last_state) {
+-                    const bool was_talking = last_state == kDeviceStateConnecting ||
+-                                             last_state == kDeviceStateListening ||
+-                                             last_state == kDeviceStateSpeaking;
+-                    if (state == kDeviceStateIdle && was_talking &&
+-                        board->actionments_ != nullptr &&
+-                        board->actionments_->current() != caiyu::Actionments::Action::kSleep) {
+-                        board->actionments_->Request(caiyu::Actionments::Action::kSleep);
++                    const DeviceState state = Application::GetInstance().GetDeviceState();
++                    if (state != last_state) {
++                        const bool was_talking = last_state == kDeviceStateConnecting ||
++                                                 last_state == kDeviceStateListening ||
++                                                 last_state == kDeviceStateSpeaking;
++                        if (state == kDeviceStateIdle && was_talking &&
++                            board->actionments_ != nullptr &&
++                            board->actionments_->current() != caiyu::Actionments::Action::kSleep) {
++                            board->actionments_->Request(caiyu::Actionments::Action::kSleep);
++                        }
++                        last_state = state;
+                     }
+-                    last_state = state;
+-                }
+ 
+-                const bool in_chat = state == kDeviceStateConnecting ||
+-                                     state == kDeviceStateListening ||
+-                                     state == kDeviceStateSpeaking;
+-                if (in_chat && board->caiyu_display_ != nullptr &&
+-                    board->actionments_ != nullptr &&
+-                    board->actionments_->current() == caiyu::Actionments::Action::kCount) {
+-                    const caiyu::Emotion emotion = board->caiyu_display_->current_emotion();
+-                    if (emotion != last_emotion &&
+-                        (xTaskGetTickCount() - last_mood_tick) >= pdMS_TO_TICKS(kMoodCooldownMs)) {
+-                        const caiyu::Actionments::MoodMove move = MoodMoveForEmotion(emotion);
+-                        board->actionments_->RequestMoodMove(move);
+-                        if (move != caiyu::Actionments::MoodMove::kNone) {
+-                            last_mood_tick = xTaskGetTickCount();
++                    const bool in_chat = state == kDeviceStateConnecting ||
++                                         state == kDeviceStateListening ||
++                                         state == kDeviceStateSpeaking;
++                    if (in_chat && board->caiyu_display_ != nullptr &&
++                        board->actionments_ != nullptr &&
++                        board->actionments_->current() == caiyu::Actionments::Action::kCount) {
++                        const caiyu::Emotion emotion = board->caiyu_display_->current_emotion();
++                        if (emotion != last_emotion &&
++                            (xTaskGetTickCount() - last_mood_tick) >=
++                                pdMS_TO_TICKS(kMoodCooldownMs)) {
++                            const caiyu::Actionments::MoodMove move = MoodMoveForEmotion(emotion);
++                            board->actionments_->RequestMoodMove(move);
++                            if (move != caiyu::Actionments::MoodMove::kNone) {
++                                last_mood_tick = xTaskGetTickCount();
++                            }
+                         }
++                        last_emotion = emotion;
+                     }
+-                    last_emotion = emotion;
+                 }
+ 
+-                vTaskDelay(pdMS_TO_TICKS(1000));
++                vTaskDelay(pdMS_TO_TICKS(kTelemetryTickMs));
+             }
+         }, "caiyu_web", 3072, this, tskIDLE_PRIORITY + 2, nullptr);
+     }
+--- a/main/boards/caiyu-c3/caiyu_actionments.cc
++++ b/main/boards/caiyu-c3/caiyu_actionments.cc
+@@ -754,9 +754,9 @@
+         }
+         drive_ = direction;
+     }
+-    if (direction != DriveDirection::kNone) {
+-        abort_ = true;
+-    }
++    // 换方向要立刻打断当前步态；松开摇杆（kNone）同样要打断，否则要等这一轮
++    // 8 帧跑完（约 1.2 s）才停下，Unity 那边会觉得"手松了狗还在走"。
++    abort_ = true;
+     ESP_LOGI(TAG, "drive: %s", DriveName(direction));
+ }
+ 
